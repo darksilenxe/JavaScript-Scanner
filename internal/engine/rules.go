@@ -74,6 +74,13 @@ type RuleMetadata struct {
 	ConfidenceRationale string   `yaml:"confidence_rationale"`
 }
 
+// RulePaths holds per-rule path inclusion and exclusion glob patterns,
+// compatible with Semgrep's `paths:` field.
+type RulePaths struct {
+	Include StringList `yaml:"include"`
+	Exclude StringList `yaml:"exclude"`
+}
+
 // Rule represents the structure of our YAML signature files.
 // The tags (yaml:"...") tell the parser how to map the YAML keys to the struct fields.
 //
@@ -125,6 +132,11 @@ type Rule struct {
 	// Taint opts the rule into intra-file taint analysis.
 	Taint *TaintConfig `yaml:"taint"`
 
+	// Paths, when set, restricts the rule to files matching the include
+	// glob patterns and excludes files matching the exclude patterns.
+	// Compatible with Semgrep's `paths:` field.
+	Paths *RulePaths `yaml:"paths"`
+
 	Metadata RuleMetadata `yaml:"metadata"`
 
 	compiled         *sitter.Query
@@ -149,19 +161,27 @@ type semgrepMetadata struct {
 }
 
 type semgrepRule struct {
-	ID            string           `yaml:"id"`
-	Severity      string           `yaml:"severity"`
-	Message       string           `yaml:"message"`
-	Query         string           `yaml:"query"`
-	Pattern       string           `yaml:"pattern"`
-	PatternEither []semgrepPattern `yaml:"pattern-either"`
-	Patterns      []semgrepPattern `yaml:"patterns"`
-	Languages     []string         `yaml:"languages"`
-	Metadata      semgrepMetadata  `yaml:"metadata"`
+	ID             string           `yaml:"id"`
+	Severity       string           `yaml:"severity"`
+	Message        string           `yaml:"message"`
+	Query          string           `yaml:"query"`
+	Pattern        string           `yaml:"pattern"`
+	PatternEither  []semgrepPattern `yaml:"pattern-either"`
+	Patterns       []semgrepPattern `yaml:"patterns"`
+	PatternRegex   string           `yaml:"pattern-regex"`
+	PatternNotRegex string          `yaml:"pattern-not-regex"`
+	Languages      []string         `yaml:"languages"`
+	Metadata       semgrepMetadata  `yaml:"metadata"`
+	Paths          semgrepPaths     `yaml:"paths"`
 }
 
 type semgrepPattern struct {
 	Pattern string `yaml:"pattern"`
+}
+
+type semgrepPaths struct {
+	Include StringList `yaml:"include"`
+	Exclude StringList `yaml:"exclude"`
 }
 
 type semgrepDocument struct {
@@ -330,6 +350,32 @@ func semgrepToRule(in semgrepRule) (Rule, bool) {
 		OWASP:              in.Metadata.OWASP,
 		Remediation:        strings.TrimSpace(in.Metadata.Remediation),
 	}
+
+	// Map pattern-not-regex → ignore_if_matches on the @finding capture.
+	// Map pattern-regex → require_if_matches on the @finding capture.
+	// These are approximate equivalents: Semgrep's pattern-*-regex operators
+	// match the full matched code text, which @finding captures here.
+	if r := strings.TrimSpace(in.PatternNotRegex); r != "" {
+		if out.IgnoreIfMatches == nil {
+			out.IgnoreIfMatches = make(map[string]string)
+		}
+		out.IgnoreIfMatches["finding"] = r
+	}
+	if r := strings.TrimSpace(in.PatternRegex); r != "" {
+		if out.RequireIfMatches == nil {
+			out.RequireIfMatches = make(map[string]string)
+		}
+		out.RequireIfMatches["finding"] = r
+	}
+
+	// Map Semgrep paths: include/exclude → per-rule path filters.
+	if len(in.Paths.Include) > 0 || len(in.Paths.Exclude) > 0 {
+		out.Paths = &RulePaths{
+			Include: in.Paths.Include,
+			Exclude: in.Paths.Exclude,
+		}
+	}
+
 	return out, true
 }
 

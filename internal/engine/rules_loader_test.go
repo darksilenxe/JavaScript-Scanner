@@ -154,3 +154,86 @@ func TestLoadRulesSkipsSemgrepPatternOnlyRules(t *testing.T) {
 	require.NoError(t, err)
 	assert.Len(t, rules, 0)
 }
+
+func TestLoadRulesSemgrepPathsFilter(t *testing.T) {
+	dir := t.TempDir()
+	ruleFile := filepath.Join(dir, "paths_rule.yaml")
+	content := `rules:
+  - id: SEMGREP-PATHS-TEST
+    severity: WARNING
+    message: Rule with path filters
+    languages: [javascript]
+    paths:
+      include:
+        - "src/**/*.js"
+      exclude:
+        - "src/vendor/**"
+    query: |
+      (call_expression
+        function: (identifier) @fn
+        (#eq? @fn "eval")
+      ) @finding
+`
+	require.NoError(t, os.WriteFile(ruleFile, []byte(content), 0o644))
+
+	rules, err := LoadRules(dir)
+	require.NoError(t, err)
+	require.Len(t, rules, 1)
+
+	require.NotNil(t, rules[0].Paths, "Paths should be populated from the bundle")
+	assert.Equal(t, []string{"src/**/*.js"}, []string(rules[0].Paths.Include))
+	assert.Equal(t, []string{"src/vendor/**"}, []string(rules[0].Paths.Exclude))
+}
+
+func TestLoadRulesSemgrepPatternNotRegex(t *testing.T) {
+	dir := t.TempDir()
+	ruleFile := filepath.Join(dir, "not_regex.yaml")
+	content := `rules:
+  - id: SEMGREP-NOT-REGEX
+    severity: ERROR
+    message: Detect eval unless it matches the safe pattern
+    languages: [javascript]
+    pattern-not-regex: "safe_eval"
+    query: |
+      (call_expression
+        function: (identifier) @fn
+        (#eq? @fn "eval")
+      ) @finding
+`
+	require.NoError(t, os.WriteFile(ruleFile, []byte(content), 0o644))
+
+	rules, err := LoadRules(dir)
+	require.NoError(t, err)
+	require.Len(t, rules, 1)
+
+	assert.Equal(t, "SEMGREP-NOT-REGEX", rules[0].ID)
+	// pattern-not-regex should be mapped to ignore_if_matches on @finding
+	assert.Equal(t, map[string]string{"finding": "safe_eval"}, rules[0].IgnoreIfMatches)
+}
+
+func TestLoadRulesSemgrepPatternRegex(t *testing.T) {
+	dir := t.TempDir()
+	ruleFile := filepath.Join(dir, "regex.yaml")
+	content := `rules:
+  - id: SEMGREP-PATTERN-REGEX
+    severity: WARNING
+    message: Detect eval only when it contains dangerous patterns
+    languages: [javascript]
+    pattern-regex: "userInput|req\\.body"
+    query: |
+      (call_expression
+        function: (identifier) @fn
+        (#eq? @fn "eval")
+      ) @finding
+`
+	require.NoError(t, os.WriteFile(ruleFile, []byte(content), 0o644))
+
+	rules, err := LoadRules(dir)
+	require.NoError(t, err)
+	require.Len(t, rules, 1)
+
+	assert.Equal(t, "SEMGREP-PATTERN-REGEX", rules[0].ID)
+	// pattern-regex should be mapped to require_if_matches on @finding
+	assert.Equal(t, map[string]string{"finding": `userInput|req\.body`}, rules[0].RequireIfMatches)
+}
+

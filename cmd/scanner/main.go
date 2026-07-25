@@ -40,6 +40,8 @@ var confidenceRank = map[string]int{
 func main() {
 	targetDir := flag.String("dir", ".", "Directory to scan")
 	rulesDir := flag.String("rules", "./rules", "Directory containing YAML rule files")
+	// --config is a Semgrep-compatible alias for --rules.
+	configDir := flag.String("config", "", "Directory containing YAML rule files (Semgrep-compatible alias for -rules; takes precedence when set)")
 	advisoriesDir := flag.String("advisories", "./advisories", "Directory containing dependency advisory YAML files")
 	packagesOut := flag.String("packages-out", "./package_versions.txt", "Output text file for package/version table")
 	packagesCSVOut := flag.String("packages-csv-out", "./package_versions.csv", "Output CSV file for package/version table")
@@ -68,6 +70,8 @@ func main() {
 	findingsSARIFOut := flag.String("findings-sarif-out", "", "Optional SARIF file for SAST findings")
 	findingsFrameworkCSVOut := flag.String("findings-framework-csv-out", "./findings_framework_summary.csv", "Output CSV file for framework/severity finding counts")
 	findingsCSVOut := flag.String("findings-csv-out", "./findings.csv", "Output CSV file with one row per finding")
+	// --findings-semgrep-json-out emits a Semgrep-compatible JSON report.
+	findingsSemgrepJSONOut := flag.String("findings-semgrep-json-out", "", "Optional path to write a Semgrep-compatible JSON findings report")
 	includeTests := flag.Bool("include-tests", false, "Include test/spec files (*.test.*, *.spec.*, __tests__, cypress, e2e, playwright) in scans")
 	includeVendored := flag.Bool("include-vendored", false, "Include vendored / build-output files (node_modules, dist, build, out, coverage, .next, vendor, *.min.js, *.d.ts) in scans")
 	gateByDependency := flag.Bool("gate-by-dependency", false, "Suppress framework-specific rules whose `requires_dependency` list does not match the scanned project's package.json (e.g. skip Angular rules when @angular/core is absent)")
@@ -76,7 +80,13 @@ func main() {
 	baselinePath := flag.String("baseline", "", "Optional JSON baseline file: findings whose fingerprint is listed are suppressed from the report (legacy debt remains hidden).")
 	baselineOut := flag.String("baseline-out", "", "Optional JSON path to write the current fingerprint set as a baseline (run once to bless legacy findings, then commit the file).")
 	failOnNewFindings := flag.Bool("fail-on-new-findings", false, "Exit non-zero when, after baseline filtering, at least one finding remains. Combine with -baseline to gate CI only on net-new findings.")
+	// --fail-on-findings mirrors Semgrep's default behavior of exiting 1 when any findings are present.
+	failOnFindings := flag.Bool("fail-on-findings", false, "Exit non-zero when any findings remain after all filtering. Compatible with Semgrep's exit-code behavior.")
 	changedFilesPath := flag.String("changed-files", "", "Optional newline-delimited file (typically `git diff --name-only`) restricting the scan to listed files while still loading full project dependency context.")
+	// --include / --exclude are Semgrep-compatible glob-based file filters.
+	// Multiple patterns can be given as a comma-separated list.
+	includeGlobs := flag.String("include", "", "Comma-separated glob patterns restricting scan to matching files (e.g. \"*.js,src/**/*.ts\"). Semgrep-compatible.")
+	excludeGlobs := flag.String("exclude", "", "Comma-separated glob patterns excluding matching files from the scan. Semgrep-compatible.")
 
 	// Sensitive-data inventory ("data map") pass. Independent of the
 	// vulnerability findings pipeline so users can audit what
@@ -97,6 +107,11 @@ func main() {
 	fetchMaxBytes := flag.Int64("fetch-max-bytes", 5*1024*1024, "Maximum bytes accepted per HTTP response when fetching JavaScript")
 	fetchSameOrigin := flag.Bool("fetch-same-origin", true, "Only download external scripts whose host matches the page URL")
 	flag.Parse()
+
+	// --config takes precedence over --rules when both are provided.
+	if cfg := strings.TrimSpace(*configDir); cfg != "" {
+		*rulesDir = cfg
+	}
 
 	// If a URL was supplied, fetch JavaScript first and redirect the
 	// rest of the pipeline at the directory we just populated.
@@ -300,6 +315,16 @@ func main() {
 	}
 	scannerEngine.SetExcludedPaths([]string{*rulesDir, *compromisedRules})
 
+	// Apply --include / --exclude glob filters (Semgrep-compatible).
+	if globs := parseGlobList(*includeGlobs); len(globs) > 0 {
+		scannerEngine.IncludeGlobs = globs
+		fmt.Printf("[*] Include globs: %v\n", globs)
+	}
+	if globs := parseGlobList(*excludeGlobs); len(globs) > 0 {
+		scannerEngine.ExcludeGlobs = globs
+		fmt.Printf("[*] Exclude globs: %v\n", globs)
+	}
+
 	if changedPaths, err := readChangedFiles(*changedFilesPath, *targetDir); err != nil {
 		log.Printf("[!] Failed to read changed-files list: %v\n", err)
 	} else if len(changedPaths) > 0 {
@@ -378,6 +403,11 @@ func main() {
 			log.Printf("[!] Failed to write findings SARIF: %v\n", sarifErr)
 		}
 	}
+	if out := strings.TrimSpace(*findingsSemgrepJSONOut); out != "" {
+		if semgrepErr := reporter.WriteSemgrepJSON(findings, *targetDir, out); semgrepErr != nil {
+			log.Printf("[!] Failed to write Semgrep JSON report: %v\n", semgrepErr)
+		}
+	}
 	if summaryErr := reporter.WriteFrameworkSummaryCSV(findings, *findingsFrameworkCSVOut); summaryErr != nil {
 		log.Printf("[!] Failed to write findings framework summary CSV: %v\n", summaryErr)
 	}
@@ -434,6 +464,10 @@ func main() {
 	}
 	if *failOnNewFindings && len(findings) > 0 {
 		log.Printf("[!] Failing because -fail-on-new-findings is set and %d finding(s) remain after baseline filtering.\n", len(findings))
+		os.Exit(1)
+	}
+	if *failOnFindings && len(findings) > 0 {
+		log.Printf("[!] Failing because -fail-on-findings is set and %d finding(s) were detected.\n", len(findings))
 		os.Exit(1)
 	}
 }
@@ -606,4 +640,29 @@ func countFingerprints(findings []engine.Finding) int {
 		seen[fp] = struct{}{}
 	}
 	return len(seen)
+}
+
+// parseGlobList splits a comma-separated list of glob patterns into a
+// deduplicated, trimmed slice, discarding blank entries. This is the
+// helper for --include and --exclude flag values.
+func parseGlobList(raw string) []string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ",")
+	seen := make(map[string]struct{}, len(parts))
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		trimmed := strings.TrimSpace(p)
+		if trimmed == "" {
+			continue
+		}
+		if _, ok := seen[trimmed]; ok {
+			continue
+		}
+		seen[trimmed] = struct{}{}
+		out = append(out, trimmed)
+	}
+	return out
 }

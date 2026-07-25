@@ -414,6 +414,146 @@ func WriteFindingsCSV(findings []engine.Finding, outputPath string) error {
 	return nil
 }
 
+// WriteSemgrepJSON writes findings in Semgrep's JSON output format for
+// CI/CD tool compatibility. The schema matches `semgrep --json` output.
+func WriteSemgrepJSON(findings []engine.Finding, targetDir string, outputPath string) error {
+	results := make([]semgrepJSONResult, 0, len(findings))
+	for _, f := range findings {
+		rel := semgrepRelPath(targetDir, f.File)
+		meta := semgrepMetadataFromFinding(f)
+		results = append(results, semgrepJSONResult{
+			CheckID: f.RuleID,
+			Path:    rel,
+			Start: semgrepPosition{Line: int(f.Line), Col: int(f.Column)},
+			End:   semgrepPosition{Line: int(f.EndLine), Col: int(f.EndColumn)},
+			Extra: semgrepResultExtra{
+				Message:     f.Description,
+				Severity:    semgrepSeverityValue(f.Severity),
+				Metadata:    meta,
+				Lines:       f.Snippet,
+				Fingerprint: f.Fingerprint,
+				IsIgnored:   false,
+			},
+		})
+	}
+
+	report := semgrepJSONReport{
+		Results: results,
+		Errors:  []interface{}{},
+		Paths:   semgrepPaths{Scanned: []string{}},
+		Stats: semgrepStats{
+			Findings: len(results),
+			Errors:   0,
+		},
+		Version: "1.0.0",
+	}
+
+	data, err := json.MarshalIndent(report, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal Semgrep JSON report: %w", err)
+	}
+	if err := os.WriteFile(outputPath, data, 0o644); err != nil {
+		return fmt.Errorf("failed to write Semgrep JSON report to file: %w", err)
+	}
+
+	fmt.Printf("[+] Successfully wrote Semgrep JSON report to: %s\n", outputPath)
+	return nil
+}
+
+// semgrepJSONReport is the top-level Semgrep --json output envelope.
+type semgrepJSONReport struct {
+	Results []semgrepJSONResult `json:"results"`
+	Errors  []interface{}       `json:"errors"`
+	Paths   semgrepPaths        `json:"paths"`
+	Stats   semgrepStats        `json:"stats"`
+	Version string              `json:"version"`
+}
+
+type semgrepPaths struct {
+	Scanned []string `json:"scanned"`
+}
+
+type semgrepStats struct {
+	Findings int `json:"findings"`
+	Errors   int `json:"errors"`
+}
+
+type semgrepJSONResult struct {
+	CheckID string            `json:"check_id"`
+	Path    string            `json:"path"`
+	Start   semgrepPosition   `json:"start"`
+	End     semgrepPosition   `json:"end"`
+	Extra   semgrepResultExtra `json:"extra"`
+}
+
+type semgrepPosition struct {
+	Line   int `json:"line"`
+	Col    int `json:"col"`
+	Offset int `json:"offset"`
+}
+
+type semgrepResultExtra struct {
+	Message     string                 `json:"message"`
+	Severity    string                 `json:"severity"`
+	Metadata    map[string]interface{} `json:"metadata,omitempty"`
+	Lines       string                 `json:"lines,omitempty"`
+	Fingerprint string                 `json:"fingerprint,omitempty"`
+	IsIgnored   bool                   `json:"is_ignored"`
+}
+
+// semgrepRelPath returns a relative path suitable for Semgrep JSON output.
+func semgrepRelPath(targetDir, findingPath string) string {
+	if rel, err := filepath.Rel(targetDir, findingPath); err == nil && !strings.HasPrefix(rel, "..") {
+		return filepath.ToSlash(rel)
+	}
+	return filepath.ToSlash(findingPath)
+}
+
+// semgrepSeverityValue maps internal severity to Semgrep's severity strings.
+func semgrepSeverityValue(severity string) string {
+	switch strings.ToUpper(strings.TrimSpace(severity)) {
+	case "CRITICAL", "HIGH":
+		return "ERROR"
+	case "MEDIUM":
+		return "WARNING"
+	default:
+		return "INFO"
+	}
+}
+
+// semgrepMetadataFromFinding builds the `extra.metadata` map from a finding.
+func semgrepMetadataFromFinding(f engine.Finding) map[string]interface{} {
+	meta := make(map[string]interface{})
+	if f.Confidence != "" {
+		meta["confidence"] = f.Confidence
+	}
+	if f.Framework != "" {
+		meta["framework"] = f.Framework
+	}
+	if f.Category != "" {
+		meta["category"] = f.Category
+	}
+	if len(f.CWE) > 0 {
+		meta["cwe"] = f.CWE
+	}
+	if len(f.OWASP) > 0 {
+		meta["owasp"] = f.OWASP
+	}
+	if len(f.Tags) > 0 {
+		meta["tags"] = f.Tags
+	}
+	if len(f.References) > 0 {
+		meta["references"] = f.References
+	}
+	if f.Remediation != "" {
+		meta["remediation"] = f.Remediation
+	}
+	if len(meta) == 0 {
+		return nil
+	}
+	return meta
+}
+
 func sarifArtifactURI(targetDir string, findingPath string) string {
 	if rel, err := filepath.Rel(targetDir, findingPath); err == nil && rel != "" && rel != "." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && rel != ".." {
 		return filepath.ToSlash(rel)

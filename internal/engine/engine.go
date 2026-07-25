@@ -548,6 +548,12 @@ func (e *Engine) matchRules(tree *sitter.Tree, sourceCode []byte, path string, l
 			continue
 		}
 
+		// Pre-compute must-not and must-match byte ranges once per file/rule.
+		mustNotRanges := collectQueryRanges(rule.compiledMustNot, tree, sourceCode)
+		mustMatchSets := collectQueryRangeSets(rule.compiledMustMatch, tree, sourceCode)
+		insideRanges := collectQueryRangesOne(rule.compiledInside, tree, sourceCode)
+		notInsideRanges := collectQueryRangesOne(rule.compiledNotInside, tree, sourceCode)
+
 		cursor := sitter.NewQueryCursor()
 		cursor.Exec(rule.compiled, tree.RootNode())
 
@@ -573,12 +579,52 @@ func (e *Engine) matchRules(tree *sitter.Tree, sourceCode []byte, path string, l
 			endRow := row
 			endCol := col
 			findingNode := findingNodeForMatch(rule, filteredMatch)
+
+			// focus_metavariable: replace the reported finding node with the
+			// named capture, if present.
+			if rule.FocusMetavariable != "" {
+				if focusNode, ok := captures[rule.FocusMetavariable]; ok && focusNode != nil {
+					findingNode = focusNode
+				}
+			}
+
 			if findingNode != nil {
 				row = findingNode.StartPoint().Row
 				col = findingNode.StartPoint().Column
 				endRow = findingNode.EndPoint().Row
 				endCol = findingNode.EndPoint().Column
 			}
+
+			// --- Composite operator filtering ---
+
+			// pattern_not: drop if the finding node's range is covered by any must-not match.
+			if findingNode != nil && nodeOverlapsAny(findingNode, mustNotRanges) {
+				continue
+			}
+
+			// must_match_queries: every query must have at least one match
+			// anywhere in this file (file-level AND co-presence).
+			if !mustMatchSetsAllNonEmpty(mustMatchSets) {
+				continue
+			}
+
+			// pattern_inside: finding node must be a descendant of an inside-matched node.
+			if findingNode != nil && rule.compiledInside != nil && !nodeIsInsideAny(findingNode, insideRanges) {
+				continue
+			}
+
+			// pattern_not_inside: finding node must NOT be a descendant of any not-inside-matched node.
+			if findingNode != nil && rule.compiledNotInside != nil && nodeIsInsideAny(findingNode, notInsideRanges) {
+				continue
+			}
+
+			// metavariable_pattern: for each capture with a sub-query, the
+			// captured node's subtree must produce at least one match.
+			if !passesMetavarPatterns(rule, captures, sourceCode) {
+				continue
+			}
+
+			// ---
 
 			line := uint32(row + 1)
 			if suppress.isSuppressed(line, rule.ID) {
@@ -617,6 +663,159 @@ func (e *Engine) matchRules(tree *sitter.Tree, sourceCode []byte, path string, l
 
 		cursor.Close()
 	}
+}
+
+// byteRange is a half-open [start, end) byte range in a source file.
+type byteRange struct {
+	start uint32
+	end   uint32
+}
+
+// collectQueryRanges runs each compiled query against the tree and returns the
+// union of all matched node byte ranges as a flat slice.
+func collectQueryRanges(queries []*sitter.Query, tree *sitter.Tree, source []byte) []byteRange {
+	if len(queries) == 0 {
+		return nil
+	}
+	var ranges []byteRange
+	for _, q := range queries {
+		ranges = append(ranges, runQueryRanges(q, tree, source)...)
+	}
+	return ranges
+}
+
+// collectQueryRangesOne is like collectQueryRanges but for a single optional query.
+func collectQueryRangesOne(q *sitter.Query, tree *sitter.Tree, source []byte) []byteRange {
+	if q == nil {
+		return nil
+	}
+	return runQueryRanges(q, tree, source)
+}
+
+// collectQueryRangeSets runs each compiled query and returns one []byteRange per
+// query, preserving the per-query identity (used for must-match AND logic).
+func collectQueryRangeSets(queries []*sitter.Query, tree *sitter.Tree, source []byte) [][]byteRange {
+	if len(queries) == 0 {
+		return nil
+	}
+	sets := make([][]byteRange, len(queries))
+	for i, q := range queries {
+		sets[i] = runQueryRanges(q, tree, source)
+	}
+	return sets
+}
+
+// runQueryRanges executes a single compiled query against the tree's root node
+// and returns the byte ranges of all matched (or widest-capture) nodes.
+func runQueryRanges(q *sitter.Query, tree *sitter.Tree, source []byte) []byteRange {
+	if q == nil {
+		return nil
+	}
+	cursor := sitter.NewQueryCursor()
+	cursor.Exec(q, tree.RootNode())
+	var ranges []byteRange
+	for {
+		m, ok := cursor.NextMatch()
+		if !ok {
+			break
+		}
+		fm := cursor.FilterPredicates(m, source)
+		if len(fm.Captures) == 0 {
+			continue
+		}
+		// Use the widest captured node as the representative range.
+		var best *sitter.Node
+		var bestSpan uint32
+		for _, c := range fm.Captures {
+			if c.Node == nil {
+				continue
+			}
+			span := c.Node.EndByte() - c.Node.StartByte()
+			if best == nil || span > bestSpan {
+				best = c.Node
+				bestSpan = span
+			}
+		}
+		if best != nil {
+			ranges = append(ranges, byteRange{best.StartByte(), best.EndByte()})
+		}
+	}
+	cursor.Close()
+	return ranges
+}
+
+// nodeOverlapsAny returns true when the node's byte range overlaps with at least
+// one of the provided ranges. Used to implement pattern_not.
+func nodeOverlapsAny(node *sitter.Node, ranges []byteRange) bool {
+	nStart := node.StartByte()
+	nEnd := node.EndByte()
+	for _, r := range ranges {
+		// Overlap when neither is fully to the left of the other.
+		if nStart < r.end && nEnd > r.start {
+			return true
+		}
+	}
+	return false
+}
+
+// mustMatchSetsAllNonEmpty returns true when every must-match query set
+// produced at least one match anywhere in the file. This implements the
+// file-level AND co-presence semantics of must_match_queries: every
+// additional required pattern must match somewhere in the same file.
+// An empty sets slice is vacuously true (no must-match constraints).
+func mustMatchSetsAllNonEmpty(sets [][]byteRange) bool {
+	for _, set := range sets {
+		if len(set) == 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// nodeIsInsideAny returns true when the node's byte range is fully contained
+// within at least one of the provided ranges. Used for pattern_inside /
+// pattern_not_inside.
+func nodeIsInsideAny(node *sitter.Node, ranges []byteRange) bool {
+	nStart := node.StartByte()
+	nEnd := node.EndByte()
+	for _, r := range ranges {
+		if r.start <= nStart && nEnd <= r.end {
+			return true
+		}
+	}
+	return false
+}
+
+// passesMetavarPatterns returns true when every metavariable_pattern entry in
+// the rule is satisfied: the captured sub-tree must produce at least one match
+// for the associated compiled query.
+func passesMetavarPatterns(rule Rule, captures map[string]*sitter.Node, source []byte) bool {
+	for cap, q := range rule.compiledMetavarPat {
+		node, ok := captures[cap]
+		if !ok || node == nil {
+			return false
+		}
+		// Run the sub-query against the captured node as the root.
+		cursor := sitter.NewQueryCursor()
+		cursor.Exec(q, node)
+		found := false
+		for {
+			m, ok2 := cursor.NextMatch()
+			if !ok2 {
+				break
+			}
+			fm := cursor.FilterPredicates(m, source)
+			if len(fm.Captures) > 0 {
+				found = true
+				break
+			}
+		}
+		cursor.Close()
+		if !found {
+			return false
+		}
+	}
+	return true
 }
 
 func (e *Engine) ScanDirectory(targetDir string, findings chan<- Finding) error {

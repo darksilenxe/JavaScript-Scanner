@@ -137,6 +137,44 @@ type Rule struct {
 	// Compatible with Semgrep's `paths:` field.
 	Paths *RulePaths `yaml:"paths"`
 
+	// --- Semgrep-compatible composite operators (Phase 5) ---
+	//
+	// PatternNot lists Tree-sitter queries whose matches must NOT overlap
+	// the primary match. Equivalent to Semgrep's `pattern-not` operator.
+	PatternNot StringList `yaml:"pattern_not"`
+
+	// PatternInside is a Tree-sitter query; a primary match is only kept
+	// when its finding node is a descendant of a node matched by this query.
+	// Equivalent to Semgrep's `pattern-inside` operator.
+	PatternInside string `yaml:"pattern_inside"`
+
+	// PatternNotInside is the inverse of PatternInside: a primary match is
+	// dropped when its finding node is a descendant of any node matched here.
+	// Equivalent to Semgrep's `pattern-not-inside` operator.
+	PatternNotInside string `yaml:"pattern_not_inside"`
+
+	// FocusMetavariable names a @capture whose node should be reported as
+	// the finding location instead of the default @finding node.
+	// Equivalent to Semgrep's `focus-metavariable` operator.
+	FocusMetavariable string `yaml:"focus_metavariable"`
+
+	// MetavariableRegex maps @capture names to regular expressions that the
+	// captured text must satisfy. Semantically identical to require_if_matches
+	// but uses the Semgrep-compatible field name.
+	MetavariableRegex map[string]string `yaml:"metavariable_regex"`
+
+	// MetavariablePattern maps @capture names to Tree-sitter queries. A
+	// primary match is only kept when the captured sub-tree itself produces
+	// at least one match for the associated query. Equivalent to Semgrep's
+	// `metavariable-pattern` operator.
+	MetavariablePattern map[string]string `yaml:"metavariable_pattern"`
+
+	// MustMatchQueries is a list of additional Tree-sitter queries that all
+	// must match somewhere in the same file for a primary match to be kept.
+	// Equivalent to the AND semantics of additional positive entries in a
+	// Semgrep `patterns:` list.
+	MustMatchQueries StringList `yaml:"must_match_queries"`
+
 	Metadata RuleMetadata `yaml:"metadata"`
 
 	compiled         *sitter.Query
@@ -145,6 +183,14 @@ type Rule struct {
 	requireMatchers  map[string]*regexp.Regexp
 	literalCaptures  map[string]struct{}
 	captureNamesInit bool
+
+	// Compiled forms of the composite operators.
+	compiledMustNot     []*sitter.Query
+	compiledInside      *sitter.Query
+	compiledNotInside   *sitter.Query
+	compiledMustMatch   []*sitter.Query
+	compiledMetavarPat  map[string]*sitter.Query
+	metavarRegexMatcher map[string]*regexp.Regexp
 }
 
 type semgrepMetadata struct {
@@ -161,22 +207,36 @@ type semgrepMetadata struct {
 }
 
 type semgrepRule struct {
-	ID             string           `yaml:"id"`
-	Severity       string           `yaml:"severity"`
-	Message        string           `yaml:"message"`
-	Query          string           `yaml:"query"`
-	Pattern        string           `yaml:"pattern"`
-	PatternEither  []semgrepPattern `yaml:"pattern-either"`
-	Patterns       []semgrepPattern `yaml:"patterns"`
-	PatternRegex   string           `yaml:"pattern-regex"`
-	PatternNotRegex string          `yaml:"pattern-not-regex"`
-	Languages      []string         `yaml:"languages"`
-	Metadata       semgrepMetadata  `yaml:"metadata"`
-	Paths          semgrepPaths     `yaml:"paths"`
+	ID               string           `yaml:"id"`
+	Severity         string           `yaml:"severity"`
+	Message          string           `yaml:"message"`
+	Query            string           `yaml:"query"`
+	Pattern          string           `yaml:"pattern"`
+	PatternEither    []semgrepPattern `yaml:"pattern-either"`
+	Patterns         []semgrepPattern `yaml:"patterns"`
+	PatternRegex     string           `yaml:"pattern-regex"`
+	PatternNotRegex  string           `yaml:"pattern-not-regex"`
+	PatternNot       string           `yaml:"pattern-not"`
+	PatternInside    string           `yaml:"pattern-inside"`
+	PatternNotInside string           `yaml:"pattern-not-inside"`
+	FocusMetavariable string          `yaml:"focus-metavariable"`
+	MetavariableRegex  map[string]string `yaml:"metavariable-regex"`
+	MetavariablePattern map[string]string `yaml:"metavariable-pattern"`
+	Languages        []string         `yaml:"languages"`
+	Metadata         semgrepMetadata  `yaml:"metadata"`
+	Paths            semgrepPaths     `yaml:"paths"`
 }
 
+// semgrepPattern is used inside `patterns:` or `pattern-either:` lists.
+// Each entry may itself carry per-entry operators in addition to a bare pattern.
 type semgrepPattern struct {
-	Pattern string `yaml:"pattern"`
+	Pattern          string            `yaml:"pattern"`
+	PatternNot       string            `yaml:"pattern-not"`
+	PatternInside    string            `yaml:"pattern-inside"`
+	PatternNotInside string            `yaml:"pattern-not-inside"`
+	FocusMetavariable string           `yaml:"focus-metavariable"`
+	MetavariableRegex  map[string]string `yaml:"metavariable-regex"`
+	MetavariablePattern map[string]string `yaml:"metavariable-pattern"`
 }
 
 type semgrepPaths struct {
@@ -228,9 +288,83 @@ func (r *Rule) compile() error {
 		r.requireMatchers[capture] = re
 	}
 
+	// MetavariableRegex is semantically identical to RequireIfMatches but
+	// uses the Semgrep-compatible field name. Merge into requireMatchers so
+	// passesFilters picks them up without extra code.
+	for capture, pattern := range r.MetavariableRegex {
+		if _, exists := r.requireMatchers[capture]; !exists {
+			re, reErr := regexp.Compile(pattern)
+			if reErr != nil {
+				return fmt.Errorf("rule %s metavariable_regex[%s]: %w", r.ID, capture, reErr)
+			}
+			r.requireMatchers[capture] = re
+		}
+	}
+
 	r.literalCaptures = make(map[string]struct{}, len(r.IgnoreIfLiteral))
 	for _, capture := range r.IgnoreIfLiteral {
 		r.literalCaptures[capture] = struct{}{}
+	}
+
+	// --- Compile composite operators ---
+
+	// pattern_not
+	r.compiledMustNot = nil
+	for i, q := range r.PatternNot {
+		if q == "" {
+			continue
+		}
+		cq, qErr := sitter.NewQuery([]byte(q), spec.language)
+		if qErr != nil {
+			return fmt.Errorf("rule %s pattern_not[%d]: %w", r.ID, i, qErr)
+		}
+		r.compiledMustNot = append(r.compiledMustNot, cq)
+	}
+
+	// pattern_inside
+	r.compiledInside = nil
+	if q := strings.TrimSpace(r.PatternInside); q != "" {
+		cq, qErr := sitter.NewQuery([]byte(q), spec.language)
+		if qErr != nil {
+			return fmt.Errorf("rule %s pattern_inside: %w", r.ID, qErr)
+		}
+		r.compiledInside = cq
+	}
+
+	// pattern_not_inside
+	r.compiledNotInside = nil
+	if q := strings.TrimSpace(r.PatternNotInside); q != "" {
+		cq, qErr := sitter.NewQuery([]byte(q), spec.language)
+		if qErr != nil {
+			return fmt.Errorf("rule %s pattern_not_inside: %w", r.ID, qErr)
+		}
+		r.compiledNotInside = cq
+	}
+
+	// must_match_queries
+	r.compiledMustMatch = nil
+	for i, q := range r.MustMatchQueries {
+		if q == "" {
+			continue
+		}
+		cq, qErr := sitter.NewQuery([]byte(q), spec.language)
+		if qErr != nil {
+			return fmt.Errorf("rule %s must_match_queries[%d]: %w", r.ID, i, qErr)
+		}
+		r.compiledMustMatch = append(r.compiledMustMatch, cq)
+	}
+
+	// metavariable_pattern
+	r.compiledMetavarPat = make(map[string]*sitter.Query, len(r.MetavariablePattern))
+	for capture, q := range r.MetavariablePattern {
+		if q == "" {
+			continue
+		}
+		cq, qErr := sitter.NewQuery([]byte(q), spec.language)
+		if qErr != nil {
+			return fmt.Errorf("rule %s metavariable_pattern[%s]: %w", r.ID, capture, qErr)
+		}
+		r.compiledMetavarPat[capture] = cq
 	}
 
 	r.captureNamesInit = true
@@ -373,6 +507,86 @@ func semgrepToRule(in semgrepRule) (Rule, bool) {
 		out.Paths = &RulePaths{
 			Include: in.Paths.Include,
 			Exclude: in.Paths.Exclude,
+		}
+	}
+
+	// --- Map Semgrep composite operators ---
+
+	// Top-level pattern-not (single query on the semgrepRule itself).
+	if q := strings.TrimSpace(in.PatternNot); q != "" {
+		out.PatternNot = append(out.PatternNot, q)
+	}
+
+	// pattern-inside / pattern-not-inside (top-level).
+	if q := strings.TrimSpace(in.PatternInside); q != "" {
+		out.PatternInside = q
+	}
+	if q := strings.TrimSpace(in.PatternNotInside); q != "" {
+		out.PatternNotInside = q
+	}
+
+	// focus-metavariable (top-level).
+	if f := strings.TrimSpace(in.FocusMetavariable); f != "" {
+		out.FocusMetavariable = f
+	}
+
+	// metavariable-regex (top-level).
+	for cap, pat := range in.MetavariableRegex {
+		if out.MetavariableRegex == nil {
+			out.MetavariableRegex = make(map[string]string)
+		}
+		out.MetavariableRegex[cap] = pat
+	}
+
+	// metavariable-pattern (top-level).
+	for cap, q := range in.MetavariablePattern {
+		if out.MetavariablePattern == nil {
+			out.MetavariablePattern = make(map[string]string)
+		}
+		out.MetavariablePattern[cap] = q
+	}
+
+	// Collect composite operators from within patterns: [] and pattern-either: [] entries.
+	// The primary query was already selected by resolveSemgrepQuery; here we harvest
+	// pattern-not / pattern-inside / pattern-not-inside / focus-metavariable /
+	// metavariable-regex / metavariable-pattern entries from sibling entries in both lists.
+	for _, p := range append(in.Patterns, in.PatternEither...) {
+		if q := strings.TrimSpace(p.PatternNot); q != "" {
+			out.PatternNot = append(out.PatternNot, q)
+		}
+		if q := strings.TrimSpace(p.PatternInside); q != "" && out.PatternInside == "" {
+			out.PatternInside = q
+		}
+		if q := strings.TrimSpace(p.PatternNotInside); q != "" && out.PatternNotInside == "" {
+			out.PatternNotInside = q
+		}
+		if f := strings.TrimSpace(p.FocusMetavariable); f != "" && out.FocusMetavariable == "" {
+			out.FocusMetavariable = f
+		}
+		for cap, pat := range p.MetavariableRegex {
+			if out.MetavariableRegex == nil {
+				out.MetavariableRegex = make(map[string]string)
+			}
+			if _, exists := out.MetavariableRegex[cap]; !exists {
+				out.MetavariableRegex[cap] = pat
+			}
+		}
+		for cap, q := range p.MetavariablePattern {
+			if out.MetavariablePattern == nil {
+				out.MetavariablePattern = make(map[string]string)
+			}
+			if _, exists := out.MetavariablePattern[cap]; !exists {
+				out.MetavariablePattern[cap] = q
+			}
+		}
+		// Additional positive patterns beyond the primary become must_match_queries.
+		if q := strings.TrimSpace(p.Pattern); q != "" && q != out.Query {
+			spec, langErr := languageSpecForName(language)
+			if langErr == nil {
+				if _, compErr := sitter.NewQuery([]byte(q), spec.language); compErr == nil {
+					out.MustMatchQueries = append(out.MustMatchQueries, q)
+				}
+			}
 		}
 	}
 

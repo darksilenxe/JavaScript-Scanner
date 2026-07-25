@@ -1,0 +1,92 @@
+# Semgrep-compatible rule bundle for darksast compatibility testing.
+# Rules in this file use the `rules:` envelope format from Semgrep/OpenGrep.
+# Each rule supplies a Tree-sitter `query` so it works with the darksast engine
+# without requiring Semgrep's pattern-matching front end.
+#
+# These rules are intentionally broad for demonstration purposes and should
+# be treated as examples rather than production security rules.
+
+rules:
+  - id: COMPAT-EVAL-EXEC
+    message: >
+      Dangerous use of eval() with a non-literal argument detected.
+      eval() executes arbitrary code, which may allow an attacker to
+      run injected JavaScript.
+    severity: ERROR
+    languages: [javascript, typescript]
+    paths:
+      include:
+        - "**/*.js"
+        - "**/*.ts"
+        - "**/*.mjs"
+      exclude:
+        - "**/node_modules/**"
+        - "**/dist/**"
+    # nosemgrep-style suppression is honored when used in scanned source files.
+    # pattern-not-regex filters out calls that already use a safe wrapper.
+    pattern-not-regex: "safeEval|sandboxEval"
+    query: |
+      (call_expression
+        function: (identifier) @fn
+        (#eq? @fn "eval")
+        arguments: (arguments (_) @arg)
+      ) @finding
+    metadata:
+      category: code-injection
+      cwe:
+        - "CWE-95: Improper Neutralization of Directives in Dynamically Evaluated Code ('Eval Injection')"
+      owasp:
+        - "A03:2021 - Injection"
+      references:
+        - https://owasp.org/Top10/A03_2021-Injection/
+      remediation: >
+        Replace eval() with a safe alternative. If dynamic code execution is
+        unavoidable, run it in a sandboxed environment with restricted
+        permissions.
+      confidence: HIGH
+      framework: JavaScript
+
+  - id: COMPAT-INNERHTML-XSS
+    message: >
+      Direct assignment to innerHTML with a non-literal value may allow
+      DOM-based cross-site scripting (XSS).
+    severity: WARNING
+    languages: [javascript]
+    paths:
+      exclude:
+        - "**/test/**"
+        - "**/*.test.js"
+        - "**/*.spec.js"
+    query: |
+      (assignment_expression
+        left: (member_expression
+          property: (property_identifier) @prop
+          (#eq? @prop "innerHTML")
+        )
+        right: (_) @value
+      ) @finding
+    metadata:
+      category: xss
+      cwe:
+        - "CWE-79: Improper Neutralization of Input During Web Page Generation"
+      owasp:
+        - "A03:2021 - Injection"
+      confidence: MEDIUM
+      framework: JavaScript
+
+  - id: COMPAT-NOSEMGREP-DEMO
+    message: >
+      This rule is used to verify that nosemgrep inline suppression comments
+      are honored. Any finding on a line that has `// nosemgrep: COMPAT-NOSEMGREP-DEMO`
+      must not appear in the output.
+    severity: INFO
+    languages: [javascript]
+    query: |
+      (call_expression
+        function: (identifier) @fn
+        (#eq? @fn "dangerousCall")
+      ) @finding
+    metadata:
+      category: test
+      confidence: LOW
+      framework: JavaScript

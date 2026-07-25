@@ -171,6 +171,17 @@ type Engine struct {
 	// callers pass `git diff --name-only` to scope a scan to changed
 	// files while still loading the full project dependency context.
 	ChangedFiles map[string]struct{}
+
+	// IncludeGlobs, when non-empty, restricts scanning to files whose
+	// path matches at least one glob pattern. Patterns without a "/"
+	// are matched against the file's base name. Supports "**" wildcards.
+	// Compatible with Semgrep's --include flag.
+	IncludeGlobs []string
+
+	// ExcludeGlobs, when non-empty, skips files whose path matches at
+	// least one glob pattern. Applied after IncludeGlobs.
+	// Compatible with Semgrep's --exclude flag.
+	ExcludeGlobs []string
 }
 
 // New constructs an Engine with default (false-positive-conservative)
@@ -211,6 +222,16 @@ func (e *Engine) shouldScanFile(path string) bool {
 	if !e.isChangedFile(path) {
 		return false
 	}
+
+	// Engine-level glob filters (--include / --exclude).
+	slashPath := filepath.ToSlash(path)
+	if len(e.IncludeGlobs) > 0 && !matchesAnyGlob(e.IncludeGlobs, slashPath) {
+		return false
+	}
+	if len(e.ExcludeGlobs) > 0 && matchesAnyGlob(e.ExcludeGlobs, slashPath) {
+		return false
+	}
+
 	return true
 }
 
@@ -485,12 +506,40 @@ func argumentCountFromCaptures(captures map[string]*sitter.Node) (int, bool) {
 	return 0, false
 }
 
+// ruleMatchesPath returns false when the rule's `paths:` filter is set
+// and the file path does not satisfy the include/exclude conditions.
+// When the rule has no path filters, it always returns true.
+//
+// Include patterns are checked first: if any include patterns are set
+// the path must match at least one. Exclude patterns are then checked:
+// if any exclude patterns match the file is skipped.
+func ruleMatchesPath(rule Rule, slashPath string) bool {
+	if rule.Paths == nil {
+		return true
+	}
+	if len(rule.Paths.Include) > 0 {
+		if !matchesAnyGlob([]string(rule.Paths.Include), slashPath) {
+			return false
+		}
+	}
+	if len(rule.Paths.Exclude) > 0 {
+		if matchesAnyGlob([]string(rule.Paths.Exclude), slashPath) {
+			return false
+		}
+	}
+	return true
+}
+
 func (e *Engine) matchRules(tree *sitter.Tree, sourceCode []byte, path string, languageKey string, findings chan<- Finding, suppress suppressionMap, taint *fileTaintModel) {
+	slashPath := filepath.ToSlash(path)
 	for _, rule := range e.Rules {
 		if !e.ruleAppliesToProject(rule) {
 			continue
 		}
 		if normalizeLanguageName(rule.EffectiveLanguage()) != languageKey {
+			continue
+		}
+		if !ruleMatchesPath(rule, slashPath) {
 			continue
 		}
 

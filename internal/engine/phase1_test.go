@@ -79,3 +79,59 @@ func TestSetChangedFilesNilDisablesDiffMode(t *testing.T) {
 	e.SetChangedFiles(nil)
 	assert.Nil(t, e.ChangedFiles)
 }
+
+// --- Semgrep nosemgrep suppression ---
+
+// TestNosemgrepSameLineSuppressesRule verifies that a `# nosemgrep: RULE-ID`
+// comment on the same line suppresses the named finding.
+func TestNosemgrepSameLineSuppressesRule(t *testing.T) {
+	src := "eval(userInput); // nosemgrep: JS-EVAL-EXEC\n"
+	path := writeTemp(t, src)
+	findings := scanFile(t, path, []Rule{evalRule})
+	assert.Empty(t, findings, "nosemgrep: RULE-ID should suppress the finding on the same line")
+}
+
+// TestNosemgrepHashStyleSuppresses verifies the Python-style `# nosemgrep: ID`
+// comment is honored.
+func TestNosemgrepHashStyleSuppresses(t *testing.T) {
+	src := "eval(userInput) # nosemgrep: JS-EVAL-EXEC\n"
+	// The scanner parses JS files; the hash # will just be treated as code but
+	// lineHasCommentBefore recognizes # as a comment opener.
+	path := writeTemp(t, src)
+	findings := scanFile(t, path, []Rule{evalRule})
+	assert.Empty(t, findings, "# nosemgrep: RULE-ID should suppress the finding")
+}
+
+// TestNosemgrepWithColonAndSpaceSuppresses verifies `nosemgrep: ID` format.
+func TestNosemgrepWithColonAndSpaceSuppresses(t *testing.T) {
+	src := "eval(userInput); // nosemgrep: JS-EVAL-EXEC\n"
+	path := writeTemp(t, src)
+	findings := scanFile(t, path, []Rule{evalRule})
+	assert.Empty(t, findings, "nosemgrep: format should suppress the finding")
+}
+
+// TestNosemgrepWithoutColonSuppresses verifies `nosemgrep RULE-ID` (no colon).
+func TestNosemgrepWithoutColonSuppresses(t *testing.T) {
+	src := "eval(userInput); // nosemgrep JS-EVAL-EXEC\n"
+	path := writeTemp(t, src)
+	findings := scanFile(t, path, []Rule{evalRule})
+	assert.Empty(t, findings, "nosemgrep RULE-ID (no colon) should suppress the finding")
+}
+
+// TestNosemgrepWildcardSuppresses verifies bare `// nosemgrep` suppresses all rules.
+func TestNosemgrepWildcardSuppresses(t *testing.T) {
+	src := "eval(userInput); // nosemgrep\n"
+	path := writeTemp(t, src)
+	findings := scanFile(t, path, []Rule{evalRule})
+	assert.Empty(t, findings, "bare nosemgrep should act as a wildcard suppressor")
+}
+
+// TestNosemgrepDifferentRuleDoesNotSuppress verifies that a nosemgrep comment
+// for a different rule ID does not suppress the current rule.
+func TestNosemgrepDifferentRuleDoesNotSuppress(t *testing.T) {
+	src := "eval(userInput); // nosemgrep: SOME-OTHER-RULE\n"
+	path := writeTemp(t, src)
+	findings := scanFile(t, path, []Rule{evalRule})
+	assert.Len(t, findings, 1, "nosemgrep for a different rule should not suppress this rule")
+}
+

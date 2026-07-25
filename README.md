@@ -10,13 +10,26 @@ JavaScript-Security-Scanner is a lightweight Go-based static scanner for applica
   - Semgrep/OpenGrep `rules: [...]` bundles when each imported rule provides a Tree-sitter-compatible `query` (or `metadata.query`).
   - Optional rule language targeting, dependency-aware rule gating (`requires_dependency` + `-gate-by-dependency`), and confidence/severity reporting.
   - Optional post-match false-positive controls (literal gates, regex require/ignore filters, argument-count gates) and taint-aware matching.
+  - Per-rule `paths.include` / `paths.exclude` glob filters (Semgrep `paths:` field) restrict which files a rule is evaluated on.
+  - Semgrep bundle fields `pattern-not-regex` and `pattern-regex` are mapped to `ignore_if_matches`/`require_if_matches` on the `@finding` capture for approximate parity.
 - Rich findings pipeline:
-  - Output formats: JSON, CSV, optional SARIF.
+  - Output formats: JSON, CSV, optional SARIF, optional Semgrep-compatible JSON (`-findings-semgrep-json-out`).
   - Precise spans (`line/column/end_line/end_column`) plus `snippet`, `matched_code`, and `highlighted_snippet`.
   - Rule-level `tags` in findings output to support grouping by sensitive-data and secret-related detections.
   - Framework/severity rollups via findings framework summary CSV.
   - Severity/confidence result gating via `-min-severity` and `-min-confidence`.
   - Optional category-based CI fail gating via `-fail-on-categories`.
+  - `-fail-on-findings` exits non-zero when any findings are present (Semgrep parity).
+- Semgrep-compatible inline suppressions:
+  - `# nosemgrep: RULE-ID` and `// nosemgrep: RULE-ID` — Semgrep's native suppression syntax, honored on the same line.
+  - Bare `// nosemgrep` acts as a wildcard suppressor (all rules on that line).
+  - All existing `// scanner-disable-line` / `// scanner-expected` directives continue to work.
+- Semgrep-compatible CLI flags:
+  - `-config DIR` — alias for `-rules DIR`.
+  - `-include GLOB` — only scan files matching the glob (e.g. `*.js,src/**/*.ts`).
+  - `-exclude GLOB` — skip files matching the glob.
+  - `-fail-on-findings` — exit 1 when any findings are present.
+  - `-findings-semgrep-json-out PATH` — emit findings in Semgrep's `--json` output schema.
 - Dependency intelligence pipeline:
   - Package inventory extraction across manifests including `package.json`, `requirements.txt`, `go.mod`, and `Cargo.toml`.
   - npm lockfile-aware resolution from `package-lock.json` / `npm-shrinkwrap.json`.
@@ -116,6 +129,11 @@ Relevant flags:
 | `-fetch-user-agent` | scanner UA | `User-Agent` header sent on each request. |
 | `-fetch-max-bytes` | `5242880` (5 MiB) | Maximum bytes accepted per response; larger responses are skipped. |
 | `-fetch-same-origin` | `true` | When `true`, skip external scripts whose host differs from the page URL. |
+| `-config` | (empty) | Semgrep-compatible alias for `-rules`; takes precedence when both are set. |
+| `-include` | (empty) | Comma-separated glob patterns: only scan files matching at least one pattern (e.g. `*.js,src/**/*.ts`). Supports `**` wildcards. Semgrep-compatible. |
+| `-exclude` | (empty) | Comma-separated glob patterns: skip files matching any pattern. Applied after `-include`. Semgrep-compatible. |
+| `-fail-on-findings` | `false` | Exit non-zero when any findings are present. Mirrors Semgrep's default exit-code behavior. |
+| `-findings-semgrep-json-out` | (empty) | Optional path to write findings in Semgrep's `--json` output schema for CI/CD tool compatibility. |
 | `-compromised-rules` | `./intel/compromised_packages.yaml` | Local YAML seed rules for compromised package intelligence. |
 | `-compromised-feed-url` | (empty) | Optional remote JSON feed for compromised package rules and IoCs. |
 | `-compromised-generated-rules-out` | (empty) | Optional YAML path to write the merged compromised package ruleset. |
@@ -228,6 +246,30 @@ Annotate a finding inline with either of two equivalent comment prefixes:
 - `// scanner-expected [RULE-ID[,RULE-ID...]]` and `// scanner-expected-next-line [RULE-ID[,RULE-ID...]]` — semantic synonyms for the two above, meant for findings you have reviewed and chosen to accept (for example in deliberately vulnerable fixtures).
 
 Omitting the rule ID list suppresses any finding on that line.
+
+Semgrep's `nosemgrep` directive is also honored:
+
+- `// nosemgrep: RULE-ID` — same-line suppression (Semgrep-compatible).
+- `# nosemgrep: RULE-ID` — Python / shell comment style.
+- `// nosemgrep RULE-ID` — colon optional.
+- `// nosemgrep` — bare wildcard; suppresses all rules on that line.
+
+Multiple rule IDs can be comma-separated in all forms: `// nosemgrep: RULE-A, RULE-B`.
+
+### Semgrep rule bundle compatibility
+
+Rules imported from Semgrep/OpenGrep `rules: [...]` bundles support these additional fields:
+
+| Field | Mapping |
+|---|---|
+| `paths.include` | Per-rule glob allowlist; rule only runs on matching files. |
+| `paths.exclude` | Per-rule glob denylist; rule is skipped on matching files. |
+| `pattern-not-regex` | Mapped to `ignore_if_matches` on `@finding`; drops findings whose matched code matches the pattern. |
+| `pattern-regex` | Mapped to `require_if_matches` on `@finding`; keeps only findings whose matched code matches the pattern. |
+
+Native rules also accept a `paths:` field with `include:` and `exclude:` glob lists.
+
+Glob patterns support `?`, `*`, and `**` (matches zero or more path segments). Patterns without a `/` are matched against the file base name only.
 
 ## Disclaimer
 

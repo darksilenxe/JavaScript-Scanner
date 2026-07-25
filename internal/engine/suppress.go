@@ -95,6 +95,16 @@ func IsVendoredPath(path string) bool {
 // Block comments (/* ... */) carrying the same directive are also honored.
 var suppressionRegex = regexp.MustCompile(`(?i)scanner-(disable-(line|next-line)|expected(?:-next-line)?)\b([^*\n\r]*)`)
 
+// nosemgrepRegex matches Semgrep's inline suppression syntax:
+//
+//	# nosemgrep: RULE-ID
+//	// nosemgrep: RULE-ID
+//	// nosemgrep RULE-ID        (colon optional)
+//	# nosemgrep                 (wildcard — suppresses all rules)
+//
+// The directive always applies to the same line it appears on.
+var nosemgrepRegex = regexp.MustCompile(`(?i)nosemgrep\b:?\s*([^*\n\r]*)`)
+
 // suppressionMap captures the set of rule IDs disabled for a given 1-based
 // line number. An empty set means "all rules disabled on this line".
 type suppressionMap map[uint32]map[string]struct{}
@@ -105,24 +115,18 @@ type suppressionMap map[uint32]map[string]struct{}
 // A directive on line N applies to:
 //   - line N itself when "scanner-disable-line" is used
 //   - line N+1 when "scanner-disable-next-line" is used
+//   - line N itself when "nosemgrep" is used (Semgrep parity)
 func buildSuppressionMap(sourceCode []byte) suppressionMap {
 	result := make(suppressionMap)
 	lines := strings.Split(string(sourceCode), "\n")
 
 	for idx, line := range lines {
+		// --- native scanner directives ---
 		matches := suppressionRegex.FindAllStringSubmatch(line, -1)
-		if len(matches) == 0 {
-			continue
-		}
-
-		// Only honor the directive when it appears inside a comment. A
-		// cheap heuristic: the directive must be preceded on the same
-		// line by `//`, `/*`, or `*` (continuation of a block comment).
-		if !lineHasCommentBefore(line, "scanner-") {
-			continue
-		}
-
 		for _, m := range matches {
+			if !lineHasCommentBefore(line, "scanner-") {
+				continue
+			}
 			directive := strings.ToLower(m[1])
 			ids := parseRuleIDList(m[3])
 
@@ -132,27 +136,43 @@ func buildSuppressionMap(sourceCode []byte) suppressionMap {
 				targetLine = uint32(idx + 2)
 			}
 
-			existing, present := result[targetLine]
-			if len(ids) == 0 {
-				// Wildcard suppression: replace with empty set sentinel.
-				result[targetLine] = make(map[string]struct{})
+			addToSuppressionMap(result, targetLine, ids)
+		}
+
+		// --- Semgrep nosemgrep directive ---
+		noSemgrepMatches := nosemgrepRegex.FindAllStringSubmatch(line, -1)
+		for _, m := range noSemgrepMatches {
+			if !lineHasCommentBefore(line, "nosemgrep") {
 				continue
 			}
-			// If a wildcard directive already covers this line, keep it.
-			if present && len(existing) == 0 {
-				continue
-			}
-			if !present {
-				existing = make(map[string]struct{})
-				result[targetLine] = existing
-			}
-			for id := range ids {
-				existing[id] = struct{}{}
-			}
+			ids := parseRuleIDList(m[1])
+			addToSuppressionMap(result, uint32(idx+1), ids)
 		}
 	}
 
 	return result
+}
+
+// addToSuppressionMap merges ids into the suppression set at targetLine.
+// An empty ids set means "wildcard – suppress all rules on this line".
+func addToSuppressionMap(result suppressionMap, targetLine uint32, ids map[string]struct{}) {
+	existing, present := result[targetLine]
+	if len(ids) == 0 {
+		// Wildcard suppression: replace with empty set sentinel.
+		result[targetLine] = make(map[string]struct{})
+		return
+	}
+	// If a wildcard directive already covers this line, keep it.
+	if present && len(existing) == 0 {
+		return
+	}
+	if !present {
+		existing = make(map[string]struct{})
+		result[targetLine] = existing
+	}
+	for id := range ids {
+		existing[id] = struct{}{}
+	}
 }
 
 // lineHasCommentBefore returns true when `marker` appears in `line`

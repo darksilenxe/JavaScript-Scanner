@@ -460,3 +460,119 @@ func TestConfidenceFromRule(t *testing.T) {
 	require.Len(t, findings, 1)
 	assert.Equal(t, "HIGH", findings[0].Confidence, "confidence is normalized to upper case")
 }
+
+// --- Layer 5: per-rule path filters (Semgrep paths: include/exclude) ---
+
+// TestRulePathIncludeRestrictsToMatchingFiles verifies that a rule with
+// paths.include only fires on files matching the pattern.
+func TestRulePathIncludeRestrictsToMatchingFiles(t *testing.T) {
+	dir := t.TempDir()
+	matchFile := filepath.Join(dir, "app.js")
+	noMatchFile := filepath.Join(dir, "app.ts")
+	require.NoError(t, os.WriteFile(matchFile, []byte("eval(x);\n"), 0o644))
+	require.NoError(t, os.WriteFile(noMatchFile, []byte("eval(x);\n"), 0o644))
+
+	// Create a TS-capable version of the eval rule (JS parser handles .ts too).
+	rule := evalRule
+	rule.Paths = &RulePaths{Include: StringList{"*.js"}}
+
+	e := New([]Rule{rule})
+	ch := make(chan Finding, 16)
+	go func() { _ = e.ScanDirectory(dir, ch) }()
+	var found []string
+	for f := range ch {
+		found = append(found, filepath.Base(f.File))
+	}
+	assert.ElementsMatch(t, []string{"app.js"}, found, "paths.include should restrict rule to .js files")
+}
+
+// TestRulePathExcludeSkipsMatchingFiles verifies that a rule with
+// paths.exclude does not fire on files matching the excluded pattern.
+func TestRulePathExcludeSkipsMatchingFiles(t *testing.T) {
+	dir := t.TempDir()
+	prodFile := filepath.Join(dir, "app.js")
+	testFile := filepath.Join(dir, "app.test.js")
+	require.NoError(t, os.WriteFile(prodFile, []byte("eval(x);\n"), 0o644))
+	require.NoError(t, os.WriteFile(testFile, []byte("eval(x);\n"), 0o644))
+
+	rule := evalRule
+	rule.Paths = &RulePaths{Exclude: StringList{"*.test.js"}}
+
+	e := New([]Rule{rule})
+	e.IncludeTests = true // so the engine itself doesn't exclude test files
+	ch := make(chan Finding, 16)
+	go func() { _ = e.ScanDirectory(dir, ch) }()
+	var found []string
+	for f := range ch {
+		found = append(found, filepath.Base(f.File))
+	}
+	assert.ElementsMatch(t, []string{"app.js"}, found, "paths.exclude should skip *.test.js files")
+}
+
+// TestRulePathNilAllowsAllFiles verifies that a rule without path filters
+// runs on every file (original behavior preserved).
+func TestRulePathNilAllowsAllFiles(t *testing.T) {
+	dir := t.TempDir()
+	for _, name := range []string{"a.js", "b.js"} {
+		require.NoError(t, os.WriteFile(filepath.Join(dir, name), []byte("eval(x);\n"), 0o644))
+	}
+	rule := evalRule // no Paths set
+
+	e := New([]Rule{rule})
+	ch := make(chan Finding, 16)
+	go func() { _ = e.ScanDirectory(dir, ch) }()
+	var found []string
+	for f := range ch {
+		found = append(found, filepath.Base(f.File))
+	}
+	assert.ElementsMatch(t, []string{"a.js", "b.js"}, found, "nil paths should allow all files")
+}
+
+// --- Layer 6: engine-level glob filters (--include / --exclude) ---
+
+// TestEngineIncludeGlobRestrictsFiles verifies that IncludeGlobs restricts
+// the scan to matching files.
+func TestEngineIncludeGlobRestrictsFiles(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "app.js"), []byte("eval(x);\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "app.ts"), []byte("eval(x);\n"), 0o644))
+
+	findings := scanContent(t, "eval(x);\n", []Rule{evalRule}, func(e *Engine) {
+		e.IncludeGlobs = []string{"*.js"}
+	})
+	// scanContent writes a single fixture.js file, so this just tests the glob logic
+	// via shouldScanFile. Use ScanDirectory for the multi-file case.
+
+	dir2 := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir2, "app.js"), []byte("eval(x);\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(dir2, "app.ts"), []byte("eval(x);\n"), 0o644))
+
+	e := New([]Rule{evalRule})
+	e.IncludeGlobs = []string{"*.js"}
+	ch := make(chan Finding, 16)
+	go func() { _ = e.ScanDirectory(dir2, ch) }()
+	var found []string
+	for f := range ch {
+		found = append(found, filepath.Base(f.File))
+	}
+	_ = findings // quiet unused warning
+	assert.ElementsMatch(t, []string{"app.js"}, found, "IncludeGlobs *.js should skip .ts files")
+}
+
+// TestEngineExcludeGlobSkipsMatchingFiles verifies that ExcludeGlobs
+// prevents matching files from being scanned.
+func TestEngineExcludeGlobSkipsMatchingFiles(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "prod.js"), []byte("eval(x);\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "fixture.js"), []byte("eval(x);\n"), 0o644))
+
+	e := New([]Rule{evalRule})
+	e.ExcludeGlobs = []string{"fixture.js"}
+	ch := make(chan Finding, 16)
+	go func() { _ = e.ScanDirectory(dir, ch) }()
+	var found []string
+	for f := range ch {
+		found = append(found, filepath.Base(f.File))
+	}
+	assert.ElementsMatch(t, []string{"prod.js"}, found, "ExcludeGlobs should skip fixture.js")
+}

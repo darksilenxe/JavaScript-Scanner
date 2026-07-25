@@ -119,6 +119,16 @@ CC=gcc go run ./cmd/scanner/main.go \
   -rules ./rules
 ```
 
+Run through an interception proxy (for example Burp/ZAP):
+
+```bash
+CC=gcc go run ./cmd/scanner/main.go \
+  -dir ./tests \
+  -rules ./rules \
+  -http-proxy http://127.0.0.1:8080 \
+  -proxy-insecure-skip-verify
+```
+
 Relevant flags:
 
 | Flag | Default | Description |
@@ -129,6 +139,8 @@ Relevant flags:
 | `-fetch-user-agent` | scanner UA | `User-Agent` header sent on each request. |
 | `-fetch-max-bytes` | `5242880` (5 MiB) | Maximum bytes accepted per response; larger responses are skipped. |
 | `-fetch-same-origin` | `true` | When `true`, skip external scripts whose host differs from the page URL. |
+| `-http-proxy` | (empty) | Optional interception proxy URL used for all outbound HTTP(S) requests (fetch mode, compromised feed, advisory feeds, GitHub advisory ingestion). |
+| `-proxy-insecure-skip-verify` | `false` | Disable TLS certificate verification for outbound HTTP(S) requests; useful with trusted interception proxies that re-sign certificates. |
 | `-config` | (empty) | Semgrep-compatible alias for `-rules`; takes precedence when both are set. |
 | `-include` | (empty) | Comma-separated glob patterns: only scan files matching at least one pattern (e.g. `*.js,src/**/*.ts`). Supports `**` wildcards. Semgrep-compatible. |
 | `-exclude` | (empty) | Comma-separated glob patterns: skip files matching any pattern. Applied after `-include`. Semgrep-compatible. |

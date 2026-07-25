@@ -2,9 +2,12 @@ package main
 
 import (
 	"bufio"
+	"crypto/tls"
 	"flag"
 	"fmt"
 	"log"
+	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -106,11 +109,16 @@ func main() {
 	fetchUserAgent := flag.String("fetch-user-agent", "", "User-Agent header used when fetching JavaScript (defaults to a clearly-identified scanner UA)")
 	fetchMaxBytes := flag.Int64("fetch-max-bytes", 5*1024*1024, "Maximum bytes accepted per HTTP response when fetching JavaScript")
 	fetchSameOrigin := flag.Bool("fetch-same-origin", true, "Only download external scripts whose host matches the page URL")
+	httpProxy := flag.String("http-proxy", "", "Optional interception proxy URL used for all outbound HTTP(S) requests (for example, http://127.0.0.1:8080)")
+	proxyInsecureSkipVerify := flag.Bool("proxy-insecure-skip-verify", false, "Disable TLS certificate verification for outbound HTTP(S) requests (use only with trusted interception proxies)")
 	flag.Parse()
 
 	// --config takes precedence over --rules when both are provided.
 	if cfg := strings.TrimSpace(*configDir); cfg != "" {
 		*rulesDir = cfg
+	}
+	if err := configureHTTPTransport(*httpProxy, *proxyInsecureSkipVerify); err != nil {
+		log.Fatalf("[!] Invalid proxy configuration: %v", err)
 	}
 
 	// If a URL was supplied, fetch JavaScript first and redirect the
@@ -665,4 +673,53 @@ func parseGlobList(raw string) []string {
 		out = append(out, trimmed)
 	}
 	return out
+}
+
+func configureHTTPTransport(proxyURLRaw string, insecureSkipVerify bool) error {
+	proxyURLRaw = strings.TrimSpace(proxyURLRaw)
+	if proxyURLRaw == "" && !insecureSkipVerify {
+		return nil
+	}
+	base, ok := http.DefaultTransport.(*http.Transport)
+	if !ok {
+		return fmt.Errorf("default HTTP transport type %T is unsupported", http.DefaultTransport)
+	}
+	transport := base.Clone()
+	if proxyURLRaw != "" {
+		parsed, err := url.Parse(proxyURLRaw)
+		if err != nil {
+			return fmt.Errorf("parse -http-proxy value: %w", err)
+		}
+		if parsed.Scheme == "" || parsed.Host == "" {
+			return fmt.Errorf("-http-proxy must include scheme and host (example: http://127.0.0.1:8080)")
+		}
+		transport.Proxy = http.ProxyURL(parsed)
+		log.Printf("[*] Outbound HTTP proxy enabled: %s", redactProxyCredentials(proxyURLRaw))
+	}
+	if insecureSkipVerify {
+		if transport.TLSClientConfig == nil {
+			transport.TLSClientConfig = &tls.Config{}
+		}
+		transport.TLSClientConfig.InsecureSkipVerify = true
+		log.Printf("[!] Outbound TLS certificate verification disabled via -proxy-insecure-skip-verify.")
+	}
+	http.DefaultTransport = transport
+	http.DefaultClient.Transport = transport
+	return nil
+}
+
+func redactProxyCredentials(raw string) string {
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return raw
+	}
+	if parsed.User == nil {
+		return parsed.String()
+	}
+	username := parsed.User.Username()
+	if username == "" {
+		username = "redacted"
+	}
+	parsed.User = url.User(username)
+	return parsed.String()
 }

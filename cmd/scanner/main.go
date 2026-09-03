@@ -21,6 +21,7 @@ import (
 	"javascript-security-scanner/internal/engine"
 	"javascript-security-scanner/internal/fetcher"
 	"javascript-security-scanner/internal/reporter"
+	"javascript-security-scanner/internal/triage"
 )
 
 // severityRank ranks severity strings so the --min-severity gate can
@@ -109,6 +110,7 @@ func main() {
 	fetchUserAgent := flag.String("fetch-user-agent", "", "User-Agent header used when fetching JavaScript (defaults to a clearly-identified scanner UA)")
 	fetchMaxBytes := flag.Int64("fetch-max-bytes", 5*1024*1024, "Maximum bytes accepted per HTTP response when fetching JavaScript")
 	fetchSameOrigin := flag.Bool("fetch-same-origin", true, "Only download external scripts whose host matches the page URL")
+	enableHolisticReview := flag.Bool("enable-holistic-review", false, "Run an opt-in, whole-codebase reachability review after scanning that annotates findings with triage_verdict/triage_rationale (REACHABLE, LIKELY_UNREACHABLE, UNKNOWN). Findings are never dropped by this review; disabled by default so existing output is unchanged.")
 	httpProxy := flag.String("http-proxy", "", "Optional interception proxy URL used for all outbound HTTP(S) requests (for example, http://127.0.0.1:8080)")
 	proxyInsecureSkipVerify := flag.Bool("proxy-insecure-skip-verify", false, "Disable TLS certificate verification for outbound HTTP(S) requests (use only with trusted interception proxies)")
 	flag.Parse()
@@ -401,6 +403,23 @@ func main() {
 		suppressedByBaseline = len(matched)
 		findings = kept
 		fmt.Printf("[*] Baseline filtered out %d known finding(s); %d remain.\n", suppressedByBaseline, len(findings))
+	}
+
+	// Optional whole-codebase reachability review. Opt-in and additive:
+	// it only annotates TriageVerdict/TriageRationale on findings and
+	// never removes or reorders them, so all downstream writers remain
+	// byte-for-byte compatible when the flag is left disabled.
+	if *enableHolisticReview {
+		project, triageErr := triage.Build(*targetDir, triage.Options{
+			IncludeTests:    *includeTests,
+			IncludeVendored: *includeVendored,
+		})
+		if triageErr != nil {
+			log.Printf("[!] Whole-codebase reachability review failed: %v\n", triageErr)
+		} else {
+			project.Review(findings)
+			fmt.Printf("[*] Whole-codebase reachability review complete for %d finding(s).\n", len(findings))
+		}
 	}
 
 	if jsonErr := reporter.WriteJSON(findings, *targetDir, *findingsJSONOut); jsonErr != nil {

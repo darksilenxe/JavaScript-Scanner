@@ -43,6 +43,10 @@ JavaScript-Security-Scanner is a lightweight Go-based static scanner for applica
   - Outputs: JSON (`-data-inventory-json-out`), per-occurrence CSV (`-data-inventory-csv-out`), aggregated summary CSV grouped by `(category, data_type, severity)` (`-data-inventory-summary-csv-out`).
   - Honors `-include-tests`, `-include-vendored`, and `-changed-files` so the inventory pass tracks the SAST pipeline's file selection.
   - Toggle with `-enable-data-inventory` (default `true`).
+- Optional whole-codebase reachability review (`-enable-holistic-review`, default `false`):
+  - Runs after the rule-based scan, once per invocation, and builds a lightweight project-wide model of JavaScript/TypeScript, Go, and Python function declarations, HTTP/CLI entry points (route registrations, `main`, `if __name__ == "__main__":`), and a name-based call graph.
+  - Annotates each finding with additive `triage_verdict` (`REACHABLE`, `LIKELY_UNREACHABLE`, or `UNKNOWN`) and `triage_rationale` fields — findings are never dropped, reordered, or otherwise altered, and existing JSON/CSV output is unchanged when the flag is left disabled.
+  - Intended as a first, deterministic step towards judging exploitability; other languages and an optional model-assisted second pass are not yet implemented.
 - Optional URL fetch mode (`-url`) that downloads inline and same-origin external scripts into `-fetch-out` and scans them with the same pipeline.
 - Scan scope controls for test/spec and vendored/build-output files via `-include-tests` and `-include-vendored`.
 - Windows-first PowerShell entry scripts plus cross-platform shell entrypoint and npm wrappers.

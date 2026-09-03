@@ -47,6 +47,13 @@ type Finding struct {
 	// derived from rule ID, the relative file path, the matched code,
 	// and normalized neighbor-line context — never raw line numbers.
 	Fingerprint string `json:"fingerprint,omitempty"`
+	// TriageVerdict and TriageRationale are populated by the optional,
+	// opt-in whole-codebase reachability review (internal/triage) when
+	// run via -enable-holistic-review. They are additive: both fields
+	// are empty (and omitted from JSON) unless that review runs, so
+	// existing output is unchanged by default.
+	TriageVerdict   string `json:"triage_verdict,omitempty"`
+	TriageRationale string `json:"triage_rationale,omitempty"`
 }
 
 const maxSnippetLen = 120
